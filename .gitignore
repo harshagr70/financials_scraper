@@ -1,0 +1,40 @@
+# Python bytecode & caches
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environments
+.env/
+.venv/
+venv/
+ENV/
+
+# Build / dist
+build/
+dist/
+*.egg-info/
+
+# Logs and temp files
+*.log
+*.tmp
+.DS_Store
+
+# Jupyter notebook checkpoints & metadata
+.ipynb_checkpoints/
+*.ipynb_save
+*/.ipynb_checkpoints/*
+
+# Jupyter runtime cache
+~/.local/share/jupyter/runtime/
+.jupyter_cache/
+
+# VSCode / IDE settings
+.vscode/
+.idea/
+
+# Poetry / Pipenv cache
+.poetry/
+pip-wheel-metadata/
+
+# Notebook output stripping (optional)
+# Keep code, strip output when committing
