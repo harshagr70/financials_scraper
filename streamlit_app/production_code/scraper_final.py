@@ -425,12 +425,8 @@ class FinancialStatementScraper:
         print(f"✓ Restructured to merger-compatible format: {len(json_output.get('sections', []))} sections")
         print(f"✓ Metadata preserved for all values")
 
-        json_path = output_filename.replace(".xlsx", ".json")
-        with open(json_path, "w") as f:
-            json.dump(json_output, f, indent=2)
-
-        print(f"✅ Exported clean JSON → {json_path}")
-        return {"status": "success", "output_file": json_path, "json": json_output}
+        # No file saving - data returned in memory only for UI display
+        return {"status": "success", "json": json_output}
 
     def extract_all_statements(self, display_output: bool = True) -> Dict[str, Dict]:
         configs = {
