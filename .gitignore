@@ -38,3 +38,5 @@ pip-wheel-metadata/
 
 # Notebook output stripping (optional)
 # Keep code, strip output when committing
+notebooks/
+production_code/

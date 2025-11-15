@@ -19,6 +19,7 @@ class FinancialStatementScraper:
     Extracts financial statements from SEC XBRL filings.
     Now integrates MetaLinks.json role detection before pattern matching.
     Includes post-processing year alignment for cash-flow instant shifts.
+    Includes automatic restructuring for merger compatibility.
     """
 
     def __init__(self, filing_url: str, openai_api_key: str = None):
@@ -56,7 +57,7 @@ class FinancialStatementScraper:
                         "Update 'User-Agent' in the code with your own email."
                     )
 
-        self.soup = BeautifulSoup(self.html_content, "html.parser")
+        self.soup = BeautifulSoup(self.html_content, "lxml")
         self.tables = self.soup.find_all("table")
         print(f"✓ Loaded HTML with {len(self.tables)} tables")
 
@@ -110,23 +111,69 @@ class FinancialStatementScraper:
                 mapping[cid] = {"date": start.get_text(strip=True), "type": "duration"}
         return mapping
 
-    # ---------------- YEAR EXTRACTION ----------------
+    # ---------------- YEAR EXTRACTION (FIXED) ----------------
     def _extract_year_from_context(self, context_ref: str) -> Optional[str]:
         if not context_ref:
             return None
-        m = re.search(r"D(\d{4})\d{4}-(\d{4})\d{4}", context_ref)
-        if m:
-            return m.group(2)
-        m = re.search(r"(\d{8})(?!.*\d{8})", context_ref)
-        if m:
-            return m.group(1)[:4]
+        
+        # PRIORITY 1: Check context_mapping FIRST (handles UUIDs and all contextRef formats)
         if context_ref in self.context_mapping:
             date = self.context_mapping[context_ref]["date"]
             y = re.search(r"(\d{4})", date)
             if y:
                 return y.group(1)
+        
+        # PRIORITY 2: Try standard date range pattern in contextRef string
+        m = re.search(r"D(\d{4})\d{4}-(\d{4})\d{4}", context_ref)
+        if m:
+            return m.group(2)
+        
+        # PRIORITY 3: Try to find last 8-digit date pattern
+        m = re.search(r"(\d{8})(?!.*\d{8})", context_ref)
+        if m:
+            return m.group(1)[:4]
+        
+        # PRIORITY 4: Last resort - look for any 4-digit year pattern
         m = re.search(r"20\d{2}", context_ref)
         return m.group(0) if m else None
+
+    # ---------------- ROBUST ID PICKER (FIXED - STANDALONE 'id' ONLY) ----------------
+    def _pick_fact_id_from_tag(self, tag) -> Optional[str]:
+        """
+        Extracts ONLY the standalone 'id' attribute value from XBRL fact tags.
+        Uses word boundary matching to ensure we match 'id=' and NOT 'data-original-id=' 
+        or any other attribute containing 'id' as part of its name.
+        Works for any id format (fact-identifier-226, F_xxx, custom formats, etc.)
+        """
+        # Primary method: Parse raw string to extract STANDALONE id attribute only
+        tag_str = str(tag)
+        
+        # Match only standalone 'id' attribute using word boundary
+        # This will match: id="..." or id='...'
+        # This will NOT match: data-original-id="...", original-id="...", fact-id="...", etc.
+        # The \b ensures 'id' is a complete word, not part of another attribute name
+        id_match = re.search(r'\bid\s*=\s*["\']([^"\']+)["\']', tag_str)
+        if id_match:
+            extracted_id = id_match.group(1)
+            return extracted_id
+        
+        # Fallback 1: Try attrs dictionary (may work in some parsers)
+        # But ensure we're getting the actual 'id' key, not something else
+        attrs = dict(tag.attrs) if hasattr(tag, "attrs") else {}
+        
+        # Only check for exact 'id' key (not 'data-id', 'original-id', etc.)
+        if 'id' in attrs:
+            potential_id = attrs['id']
+            if potential_id:
+                return potential_id
+        
+        # Fallback 2: Look for 'ix' attribute as last resort
+        # (this is the inline XBRL identifier like F_xxx)
+        if attrs.get("ix"):
+            return attrs.get("ix")
+        
+        # Fallback 3: If nothing found, return None
+        return None
 
     # ---------------- XBRL EXTRACTION + POST-ALIGNMENT ----------------
     def _extract_xbrl_data_from_table(self, table, statement_type: str) -> Tuple[List[str], List[Dict[str, str]]]:
@@ -144,21 +191,69 @@ class FinancialStatementScraper:
                     year = self._extract_year_from_context(cref)
                     if not year:
                         continue
+
                     val = tag.get_text(strip=True)
+
+                    # ========== UNIVERSAL NEGATIVE VALUE DETECTION ==========
+                    # Get the parent row to search for parentheses pattern
+                    parent_row = tag.find_parent('tr')
+                    
+                    if parent_row and val:
+                        # Get the entire row's text
+                        row_text = parent_row.get_text(strip=True)
+                        
+                        # Remove commas from value for matching (handles "14,264" vs "14264")
+                        val_clean = val.replace(',', '')
+                        
+                        # Search for pattern: (value) with optional whitespace and commas
+                        # This handles: (307), ( 307 ), (14,264), ( 14,264 ), etc.
+                        pattern = rf'\(\s*{re.escape(val)}\s*\)'
+                        
+                        # Also try without commas in case they're formatted differently
+                        pattern_no_comma = rf'\(\s*{re.escape(val_clean)}\s*\)'
+                        
+                        # Check if value appears wrapped in parentheses anywhere in the row
+                        if re.search(pattern, row_text) or re.search(pattern_no_comma, row_text):
+                            # Only mark as negative if not already negative
+                            if not val.startswith('-'):
+                                val = '-' + val
+                    # =========================================================
+    
+                    # --- Robust ID extraction using helper ---
+                    tag_id = self._pick_fact_id_from_tag(tag)
+                    # ------------------------------------------------
+
                     meta = {
                         "name": tag.get("name"),
-                        "id": tag.get("id"),
+                        "id": tag_id,
                         "unitref": tag.get("unitref"),
                         "decimals": tag.get("decimals"),
                         "format": tag.get("format"),
                         "scale": tag.get("scale"),
-                            }
-                    
+                    }
+
                     year_values[year] = {"value": val, "meta": meta}
                     all_years.add(year)
 
             if line_item or year_values:
                 structured_rows.append({"line_item": line_item, "values": year_values})
+
+        # ========== NOISE FILTER - REMOVE UNWANTED HEADER ROWS ==========
+        NOISE_PATTERNS = [
+            r'(year|years|month|months|quarter|period)s?\s+(ended|ending)',
+            r'^(january|february|march|april|may|june|july|august|september|october|november|december)\s*\d{0,2}',
+            r'\(in (millions?|thousands?|billions?|dollars?)\b',
+            r'except (per share|share data)',
+            r'^\d{4}$|^\d{1,2}/\d{1,2}/\d{2,4}$',
+            r'^(as of|for the|fiscal year)',
+            r'^\s*$'
+        ]
+
+        structured_rows = [
+            r for r in structured_rows
+            if r['values'] or not any(re.search(p, r['line_item'].lower()) for p in NOISE_PATTERNS)
+        ]
+        # ================================================================
 
         # dominant year sequence
         year_counts = {}
@@ -186,6 +281,63 @@ class FinancialStatementScraper:
             all_years.update(r["values"].keys())
 
         return sorted(all_years, reverse=True), structured_rows
+
+    # ---------------- RESTRUCTURE FOR MERGER ----------------
+    @staticmethod
+    def _restructure_for_merger(flat_json: dict) -> dict:
+        statement_type = flat_json.get("statement_type", "")
+        years = flat_json.get("years", [])
+        rows = flat_json.get("rows", [])
+
+        sections = []
+        current_section = None
+        pending_section_candidates = []
+
+        for row in rows:
+            line_item = row.get("line_item", "").strip()
+            values = row.get("values", {})
+            has_values = bool(values)
+
+            if not has_values:
+                pending_section_candidates.append(line_item)
+            else:
+                if pending_section_candidates:
+                    section_label = pending_section_candidates[-1].rstrip(":").strip()
+                    current_section = {
+                        "section": section_label,
+                        "gaap": None,
+                        "items": []
+                    }
+                    sections.append(current_section)
+                    pending_section_candidates = []
+
+                if current_section is None:
+                    current_section = {
+                        "section": "Main",
+                        "gaap": None,
+                        "items": []
+                    }
+                    sections.append(current_section)
+
+                item_gaap = None
+                for year_key, year_data in values.items():
+                    if isinstance(year_data, dict) and "meta" in year_data:
+                        item_gaap = year_data["meta"].get("name")
+                        break
+
+                preserved_values = {year_key: year_data for year_key, year_data in values.items()}
+
+                current_section["items"].append({
+                    "label": line_item,
+                    "gaap": item_gaap,
+                    "values": preserved_values
+                })
+
+        return {
+            "statement_type": statement_type,
+            "periods": years,
+            "sections": sections
+        }
 
     # ---------------- TABLE / EXCEL HELPERS ----------------
     def extract_table_data(self, table_idx: int, statement_type: str) -> List[List[str]]:
@@ -244,14 +396,12 @@ class FinancialStatementScraper:
                 anchor_idx = matches[0]
             else:
                 return {"status": "failed", "error": f"Could not locate {statement_name}"}
-        
+
         data = self.extract_table_data(anchor_idx, statement_type)
-        
-        # If extract_table_data returns XBRL-structured rows
+
         if isinstance(data, dict) and "rows" in data:
-            json_output = data
+            flat_json = data
         else:
-            # Convert tabular data → JSON-like format
             if not data or len(data) < 2:
                 return {"status": "failed", "error": f"No data found for {statement_name}"}
             years = data[0][1:]
@@ -260,16 +410,18 @@ class FinancialStatementScraper:
                 label = r[0]
                 vals = {y: v for y, v in zip(years, r[1:]) if v != ""}
                 rows.append({"line_item": label, "values": vals})
-            json_output = {"statement_type": statement_type, "years": years, "rows": rows}
-        
-        # --- Save clean JSON ---
+            flat_json = {"statement_type": statement_type, "years": years, "rows": rows}
+
+        json_output = self._restructure_for_merger(flat_json)
+        print(f"✓ Restructured to merger-compatible format: {len(json_output.get('sections', []))} sections")
+        print(f"✓ Metadata preserved for all values")
+
         json_path = output_filename.replace(".xlsx", ".json")
         with open(json_path, "w") as f:
             json.dump(json_output, f, indent=2)
-        
+
         print(f"✅ Exported clean JSON → {json_path}")
         return {"status": "success", "output_file": json_path, "json": json_output}
-
 
     def extract_all_statements(self, display_output: bool = True) -> Dict[str, Dict]:
         configs = {
@@ -302,15 +454,102 @@ class FinancialStatementScraper:
                     c.font = bold
         wb.save(output_path)
 
-    # ---------------- META-LINK TABLE MATCHING ----------------
+    # ================ NEW: ITEM 8 HYPERLINK FALLBACK ================
+    def find_table_by_item8_hyperlink(self, statement_type: str) -> Optional[int]:
+        """
+        Fallback method: Find statement table using Item 8 hyperlinks.
+        Searches for hyperlinks in the document that reference financial statements,
+        then locates the table following that anchor.
+        Uses substring matching with parenthetical exclusion.
+        """
+        print("🔍 Trying Item 8 hyperlink fallback...")
+
+        # Define search patterns for each statement type (core phrases to match)
+        STATEMENT_PATTERNS = {
+            "balance_sheet": [
+                "consolidated balance sheets",
+                "Consolidated Balance Sheets",
+                "balance sheets",
+                "consolidated statements of financial position",
+                "statements of financial position"
+            ],
+            "income_statement": [
+                "consolidated statements of income",
+                "Consolidated Statements of Income",
+                "statements of income",
+                "consolidated statements of operations",
+                "statements of operations",
+                "consolidated statements of earnings",
+                "statements of earnings"
+            ],
+            "cash_flow": [
+                "consolidated statements of cash flows",
+                "statements of cash flows",
+                "Consolidated Statements of Cash Flows",
+                "consolidated cash flow statements"
+            ]
+        }
+
+        patterns = STATEMENT_PATTERNS.get(statement_type, [])
+        if not patterns:
+            return None
+
+        # Search for hyperlinks pointing to statements
+        for link in self.soup.find_all('a', href=True):
+            link_text = link.get_text(strip=True).lower()
+            href = link.get('href', '')
+
+            # Check if link text contains statement patterns (handles "Aon plc Consolidated Statements of Income")
+            for pattern in patterns:
+                pattern_lower = pattern.lower()
+
+                # Check if pattern exists in link text
+                if pattern_lower in link_text:
+                    # Find where the pattern ends in the link text
+                    pattern_start = link_text.find(pattern_lower)
+                    pattern_end = pattern_start + len(pattern_lower)
+
+                    # Get text after the pattern
+                    remaining_text = link_text[pattern_end:].strip()
+
+                    # Exclude if there's parenthetical content after the pattern
+                    # This rejects "(Parenthetical)" or "(Details)" etc.
+                    if remaining_text and remaining_text.startswith('('):
+                        continue  # Skip this match
+                    
+                    # Valid match found - extract anchor ID from href
+                    if '#' in href:
+                        anchor_id = href.split('#')[-1]
+
+                        # Find the element with this ID
+                        anchor_element = self.soup.find(attrs={"id": anchor_id})
+
+                        if anchor_element:
+                            # Find the next table after this anchor
+                            next_table = anchor_element.find_next('table')
+
+                            if next_table:
+                                # Find the index of this table in self.tables
+                                try:
+                                    table_idx = self.tables.index(next_table)
+                                    print(f"✓ Item 8 hyperlink matched '{link_text[:50]}...' → table {table_idx}")
+                                    return table_idx
+                                except ValueError:
+                                    continue
+                                
+        print(f"⚠ Item 8 hyperlink fallback failed for {statement_type}")
+        return None
+    # ================================================================
+
+    # ---------------- META-LINK TABLE MATCHING (UPDATED - FIXED) ----------------
     def find_table_by_unique_anchor(self, role_id: Optional[str], statement_type: str) -> Optional[int]:
         """
-        Locate table by using MetaLinks.json uniqueAnchor before pattern search.
-        Falls back to None if not found.
+        Find table using MetaLinks uniqueAnchor with proper name + contextRef matching.
+        Falls back to Item 8 hyperlinks if uniqueAnchor is null or matching fails.
         """
         if not self.metalinks:
             return None
-
+        
         TAXONOMY_MAP = {
             "balance_sheet": [
                 "consolidated balance sheets",
@@ -322,6 +561,7 @@ class FinancialStatementScraper:
             "income_statement": [
                 "consolidated statements of operations",
                 "consolidated statement of operations",
+                "Consolidated Statements of Income",
                 "income statement",
                 "income statements",
                 "consolidated statements of profit or loss",
@@ -335,15 +575,15 @@ class FinancialStatementScraper:
                 "consolidated statements of cash flows",
                 "consolidated statement of cash flows",
                 "statement of cash flows",
+                "cash flows statements"
             ],
         }
-
+        
         statement_roles = {
             rid: r for rid, r in self.metalinks.items()
             if r.get("groupType", "").lower() == "statement"
         }
-
-        # Build lookup by shortname
+        
         role_lookup = {}
         for rid, rpt in statement_roles.items():
             shortname = rpt.get("shortName", "").lower().strip()
@@ -351,27 +591,59 @@ class FinancialStatementScraper:
                 if any(shortname == n.lower() for n in names):
                     role_lookup[stype] = (rid, rpt)
                     break
-
-        # 1️⃣ if explicit role id given
+        
+        # Helper function to find table using uniqueAnchor
+        def find_table_with_anchor(role: Dict) -> Optional[int]:
+            """Find table by matching both name and contextRef from uniqueAnchor"""
+            unique_anchor = role.get("uniqueAnchor")
+            
+            # Check if uniqueAnchor exists and is not null
+            if not unique_anchor or not isinstance(unique_anchor, dict):
+                return None
+            
+            anchor_name = unique_anchor.get("name")
+            anchor_context = unique_anchor.get("contextRef")
+            
+            if not anchor_name:
+                return None
+            
+            # Search through all tables
+            for idx, tbl in enumerate(self.tables):
+                # If contextRef is provided, match BOTH name AND contextRef
+                if anchor_context:
+                    matching_tag = tbl.find(attrs={"name": anchor_name, "contextref": anchor_context})
+                    if matching_tag:
+                        print(f"✓ MetaLinks matched with name='{anchor_name}' AND contextRef='{anchor_context}' → table {idx}")
+                        return idx
+                else:
+                    # If no contextRef, fall back to name-only matching
+                    matching_tag = tbl.find(attrs={"name": anchor_name})
+                    if matching_tag:
+                        print(f"✓ MetaLinks matched with name='{anchor_name}' (no contextRef check) → table {idx}")
+                        return idx
+            
+            return None
+        
+        # Try direct role_id match first
         if role_id and role_id in statement_roles:
             role = statement_roles[role_id]
-            anchor = role.get("uniqueAnchor", {}).get("name")
-            if anchor:
-                for idx, tbl in enumerate(self.tables):
-                    if tbl.find(attrs={"name": anchor}):
-                        print(f"✓ MetaLinks direct match for {role_id} → table {idx}")
-                        return idx
-
-        # 2️⃣ else detect by statement_type taxonomy match
+            table_idx = find_table_with_anchor(role)
+            if table_idx is not None:
+                return table_idx
+        
+        # Try statement_type lookup
         if statement_type in role_lookup:
             _, role = role_lookup[statement_type]
-            anchor_name = role.get("uniqueAnchor", {}).get("name")
-            if anchor_name:
-                for idx, tbl in enumerate(self.tables):
-                    if tbl.find(attrs={"name": anchor_name}):
-                        print(f"✓ MetaLinks matched {statement_type} → table {idx}")
-                        return idx
-
+            table_idx = find_table_with_anchor(role)
+            if table_idx is not None:
+                return table_idx
+        
+        # If uniqueAnchor is null or matching failed, try Item 8 hyperlink fallback
+        print("⚠ MetaLinks uniqueAnchor is null or matching failed")
+        hyperlink_idx = self.find_table_by_item8_hyperlink(statement_type)
+        if hyperlink_idx is not None:
+            return hyperlink_idx
+        
         return None
 
     def find_table_by_pattern(self, keywords: List[str], min_length: int = 800) -> List[int]:
@@ -385,5 +657,12 @@ class FinancialStatementScraper:
 
 print("✓ Financial Statement Scraper loaded successfully!")
 print("✓ Integrated MetaLinks-based statement detection")
+print("✓ Item 8 hyperlink fallback added")
 print("✓ Pattern-based fallback retained")
-print("✓ Post-alignment year correction active\n")
+print("✓ Post-alignment year correction active")
+print("✓ Noise filter integrated for clean data extraction")
+print("✓ Auto-restructuring for merger compatibility enabled")
+print("✓ Metadata preservation active")
+print("✓ Robust standalone 'id' extraction implemented for citations")
+print("✓ UUID contextRef handling fixed - context_mapping checked first")
+print("✓ FIXED: uniqueAnchor now matches BOTH name AND contextRef for precise table detection\n")

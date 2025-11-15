@@ -160,6 +160,23 @@ class FinancialStatementScraper:
             if line_item or year_values:
                 structured_rows.append({"line_item": line_item, "values": year_values})
 
+        # ========== NOISE FILTER - REMOVE UNWANTED HEADER ROWS ==========
+        NOISE_PATTERNS = [
+            r'(year|years|month|months|quarter|period)s?\s+(ended|ending)',
+            r'^(january|february|march|april|may|june|july|august|september|october|november|december)\s*\d{0,2}',
+            r'\(in (millions?|thousands?|billions?|dollars?)\b',
+            r'except (per share|share data)',
+            r'^\d{4}$|^\d{1,2}/\d{1,2}/\d{2,4}$',
+            r'^(as of|for the|fiscal year)',
+            r'^\s*$'  # Empty or whitespace only
+        ]
+        
+        structured_rows = [
+            r for r in structured_rows 
+            if r['values'] or not any(re.search(p, r['line_item'].lower()) for p in NOISE_PATTERNS)
+        ]
+        # ================================================================
+
         # dominant year sequence
         year_counts = {}
         for row in structured_rows:
@@ -335,6 +352,7 @@ class FinancialStatementScraper:
                 "consolidated statements of cash flows",
                 "consolidated statement of cash flows",
                 "statement of cash flows",
+                "cash flows statements"
             ],
         }
 
@@ -386,4 +404,5 @@ class FinancialStatementScraper:
 print("✓ Financial Statement Scraper loaded successfully!")
 print("✓ Integrated MetaLinks-based statement detection")
 print("✓ Pattern-based fallback retained")
-print("✓ Post-alignment year correction active\n")
+print("✓ Post-alignment year correction active")
+print("✓ Noise filter integrated for clean data extraction\n")
